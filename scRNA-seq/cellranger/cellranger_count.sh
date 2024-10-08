@@ -9,7 +9,6 @@ sleep 1
 sbatch E12_5.sh
 sleep 1
 
-
 sbatch E14_5.sh
 sleep 1
 
@@ -18,7 +17,6 @@ sleep 1
 
 sbatch E16_5.sh
 sleep 1
-
 
 sbatch E9_5.sh
 sleep 1
