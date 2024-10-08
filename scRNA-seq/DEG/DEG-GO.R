@@ -86,7 +86,7 @@ plot$p.adjust <- -10*(log(10,plot$p.adjust))
 
 # GO plot
 p <- ggplot(plot, aes(x = Description, y = Gene, size = Count, fill = p.adjust)) +
-  geom_point(shape = 21, stroke = 1) +  # shape 21 是一个有边框的圆
+  geom_point(shape = 21, stroke = 1) +  # shape 21 
   theme_minimal() +
   coord_flip() +
   theme_bw() + 
