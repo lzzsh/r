@@ -13,7 +13,7 @@
 SECONDS=0
 
 # Activate the specific conda environment for R
-source /home/liuxiaodongLab/liuyifang/miniconda3/etc/profile.d/conda.sh
+source /home/liuxiaodongLab/liaozizhuo/miniconda3/etc/profile.d/conda.sh
 conda activate R-4.4.0
 which R
 
