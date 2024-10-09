@@ -1,0 +1,337 @@
+#!/usr/bin/env python
+import argparse
+import glob
+import itertools
+import logging
+import multiprocessing as mp
+import os
+import sys
+import pysam
+from gzip import open as gzopen
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+from Bio.SeqIO.QualityIO import FastqGeneralIterator
+
+config: Dict[str, int] = {
+    "LEFT_ADAPTER": 0,
+    "RIGHT_ADAPTER": 0,
+    "POOL_BARCODE": 0,
+    "CELL_BARCODE": 7,
+    "UMI": 8,
+    "DEFAULT_SAMPLE_NAME": "GGTTTACT",  # arbitrary sequence
+}
+
+
+def check_folder(folder: str, mandatory: Optional[bool] = False):
+    """Checks if folder exists, otherwise create it.
+
+    Args:
+        folder (str): Output folder
+    """
+    if not os.path.exists(folder):
+        if mandatory:
+            logging.error(f"Folder {folder} not found!")
+            sys.exit(-1)
+        else:
+            logging.warning(f"Missing folder {folder}, creating ...")
+            os.mkdir(folder)
+
+
+def trim_cdna(r1: List[str]) -> Tuple[str, str]:
+    """Trim cdna by removing adapters and Pool barcode.
+
+    Args:
+        r1 (List[str]): full cdna sequence
+
+    Returns:
+        Tuple[str, str]: trimmed cdna and quality
+    """
+    global config
+
+    # [0]: header, [1]: seq, [2]: quality
+    _, seq, qa = r1
+    cdna: str = seq
+    cdna_quality: str = qa
+
+    return cdna, cdna_quality
+
+
+def create_r2(r1: FastqGeneralIterator, r2: FastqGeneralIterator) -> Tuple[str, str]:
+    """Create R2 consisting of
+        - pool barcode (4bp)
+        - cell barcode (7bp)
+        - UMI          (8bp)
+
+    Args:
+        r1 ([FastqGeneralIterator]): R1 read
+        r2 ([FastqGeneralIterator]): R2 read
+
+    Returns:
+        Tuple[str, str]: New barcode sequence and quality
+    """
+    global config
+
+    _, r1_seq, r1_qa = r1
+    _, r2_seq, r2_qa = r2
+
+    # get pool barcode
+    pb_seq: str = r1_seq[config["LEFT_ADAPTER"] : config["LEFT_ADAPTER"] + config["POOL_BARCODE"]]
+    pb_qa: str = r1_qa[config["LEFT_ADAPTER"] : config["LEFT_ADAPTER"] + config["POOL_BARCODE"]]
+
+    barcode_len: int = config["POOL_BARCODE"] + config["CELL_BARCODE"] + config["UMI"]
+    barcode_seq: str = f"{pb_seq}{r2_seq}"[:barcode_len]
+    barcode_qa: str = f"{pb_qa}{r2_qa}"[:barcode_len]
+
+    return barcode_seq, barcode_qa
+
+
+def convert_to_10x(params: Tuple[str, str, str, str], chunk_size: int = 100) -> None:
+    """Main function processing the reads.
+
+    Args:
+        params (Tuple[str, str, str, str]): R1, R2, input, output folder
+    """
+    fastq_r1, fastq_r2, input_folder, output_folder = params
+
+    with gzopen(fastq_r1, "rt") as fq_r1, gzopen(fastq_r2, "rt") as fq_r2, gzopen(
+        f"{output_folder}/{os.path.basename(fastq_r1)}", "wt"
+    ) as fastq_r1_out, gzopen(f"{output_folder}/{os.path.basename(fastq_r2)}", "wt") as fastq_r2_out:
+        fastq_r1 = FastqGeneralIterator(fq_r1)
+        fastq_r2 = FastqGeneralIterator(fq_r2)
+
+        counter: int = 0
+        fastq_r1_content, fastq_r2_content = "", ""
+        for r1, r2 in zip(fastq_r1, fastq_r2):
+            # [0]: header, [1]: seq, [2]: quality
+
+            cdna, cdna_quality = trim_cdna(r1)
+            barcode, barcode_quality = create_r2(r1, r2)
+
+            fastq_r1_content += f'@{r1[0]}:{config["DEFAULT_SAMPLE_NAME"]}\n{barcode}\n+\n{barcode_quality}\n'
+            fastq_r2_content += f'@{r2[0]}:{config["DEFAULT_SAMPLE_NAME"]}\n{cdna}\n+\n{cdna_quality}\n'
+
+            if counter % chunk_size == 0:
+                fastq_r1_out.write(fastq_r1_content)
+                fastq_r2_out.write(fastq_r2_content)
+                counter, fastq_r1_content, fastq_r2_content = 0, "", ""
+
+        # write the rest of the file
+        if counter != 0:
+            fastq_r1_out.write(fastq_r1_content)
+            fastq_r2_out.write(fastq_r2_content)
+
+
+def convert(fastqs_folder: str, output_folder: str, threads: int):
+    """Main function for converting MARS-seq raw files to 10X format.
+
+    Args:
+        input_folder (str): Input folder
+        output_folder (str): Output folder
+    """
+
+    check_folder(fastqs_folder, mandatory=True)
+    check_folder(output_folder)
+
+    r1_files = sorted(glob.glob(f"{fastqs_folder}/*r1*.fastq.gz"))
+    r2_files = sorted(glob.glob(f"{fastqs_folder}/*r2*.fastq.gz"))
+
+    if len(r1_files) != len(r2_files):
+        print(f"Something is off, please check you have the same amount of paired-end files!")
+        sys.exit(-1)
+
+    data = zip(
+        r1_files,
+        r2_files,
+        itertools.repeat(fastqs_folder, len(r1_files)),
+        itertools.repeat(output_folder, len(r1_files)),
+    )
+    with mp.Pool(threads) as pool:
+        _ = pool.map(convert_to_10x, data)
+
+
+def whitelist(batch_file: str, amp_batches: str, well_cells: str):
+
+    with open(batch_file, 'r') as f:
+        batches_list = [line.strip() for line in f]
+
+    batches_df = pd.read_excel(amp_batches)
+    wells_df = pd.read_excel(well_cells)
+
+    for batch in batches_list:
+        # preprocess and clean-up
+        selected_batches = batches_df[batches_df.Amp_batch_ID == batch].astype("category")
+        selected_wells = wells_df[wells_df.Amp_batch_ID.isin(selected_batches.Amp_batch_ID)]
+        selected_wells = selected_wells[["Amp_batch_ID", "Cell_barcode"]]
+        selected_wells["Amp_batch_ID"] = selected_wells["Amp_batch_ID"].str.strip().astype("category")
+        selected_wells["Cell_barcode"] = selected_wells["Cell_barcode"].str.strip().astype("category")
+
+        # merge and concat barcodes
+        selected_wells = pd.merge(selected_wells,selected_batches, on="Amp_batch_ID", how="left")
+        selected_wells["whitelist"] = selected_wells[[ "Cell_barcode"]]
+
+        # save
+        selected_wells["whitelist"].to_csv(f"whitelist_{batch}.txt", header=None, index=None)
+
+
+def convert(bams_folder: str, output_folder: str):
+    """Main function for converting MARS-seq raw files to 10X format.
+
+    Args:
+        input_folder (str): Input folder
+        output_folder (str): Output folder
+    """
+
+    check_folder(fastqs_folder, mandatory=True)
+    check_folder(output_folder)
+
+    r1_files = sorted(glob.glob(f"{fastqs_folder}/*r1*.fastq.gz"))
+    r2_files = sorted(glob.glob(f"{fastqs_folder}/*r2*.fastq.gz"))
+
+    if len(r1_files) != len(r2_files):
+        print(f"Something is off, please check you have the same amount of paired-end files!")
+        sys.exit(-1)
+
+    data = zip(
+        r1_files,
+        r2_files,
+        itertools.repeat(fastqs_folder, len(r1_files)),
+        itertools.repeat(output_folder, len(r1_files)),
+    )
+    with mp.Pool(threads) as pool:
+        _ = pool.map(convert_to_10x, data)
+
+
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s  %(message)s", "%d-%m-%Y %H:%M:%S")
+
+    arg_parser = argparse.ArgumentParser(description="Plugin for converting and running velocity on MARS-seq v2.")
+
+    arg_parser.add_argument("--version", "-v", action="version", version=f"velocity 0.1")
+    command_parser = arg_parser.add_subparsers(dest="command")
+
+    # convert
+    convert_parser = command_parser.add_parser("convert", help="Convert reads to 10X format")
+    convert_parser.add_argument("--input", type=str, help="Input folder with fastq files", required=True)
+    convert_parser.add_argument("--output", type=str, help="Output folder", required=True)
+    convert_parser.add_argument("--threads", type=int, help="Number of threads", required=True, default=4)
+
+    # whitelist
+    whitelist_parser = command_parser.add_parser("whitelist", help="Create whitelist for StarSolo.")
+    whitelist_parser.add_argument("--batch", type=str, help="Batch name", required=True)
+    whitelist_parser.add_argument("--amp_batches", type=str, help="Amplification batches [xls]", required=True)
+    whitelist_parser.add_argument("--well_cells", type=str, help="Well cells [xls]", required=True)
+
+    # embryo extraction
+    whitelist_parser = command_parser.add_parser("extract", help="extract embryo from different samples.")
+    whitelist_parser.add_argument("--input", type=str, help="Input folder with bam", required=True)
+    whitelist_parser.add_argument("--output", type=str, help="output folder", required=True)
+
+
+    args = arg_parser.parse_args()
+
+    if args.command == "convert":
+        convert(args.input, args.output, args.threads)
+    elif args.command == "whitelist":
+        whitelist(args.batch, args.amp_batches, args.well_cells)
+    elif args.command == "extract":
+        whitelist(args.input, args.output)   
+    else:
+        logging.error(f"Command {args.command} not recognized!")
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python
+import pysam
+import pandas as pd
+import argparse
+import logging
+
+def extract_reads(SRR_sample, output_bam):
+    # 读取样本信息
+    amplication_batch = pd.read_csv("amplication_batch.csv")
+    metadata = pd.read_table("GSE267870_cell_metadata_mars_seq.tsv", sep="\t")
+    pd.set_option('display.max_columns', None)
+    # pd.set_option('display.max_rows', None)
+
+    # 合并信息
+    merged_data = amplication_batch.merge(metadata, left_on='Amp_batch_ID', right_on='Plate')
+    selected_columns = ['Amp_batch_ID', 'embryo', 'well_barcode', 'GSM', 'SRR']
+    cr_tag_values = merged_data[selected_columns]
+    cr_tag_values = cr_tag_values[cr_tag_values['embryo'] != "empty"]
+    # print(cr_tag_values)
+
+    # 获取胚胎和barcode对应信息
+    embryo_info = cr_tag_values.groupby('Amp_batch_ID')['embryo'].agg(lambda x: list(set(x)))
+    embryo_info = embryo_info.reset_index()
+    embryo_info = embryo_info.merge(amplication_batch[['Amp_batch_ID', 'GSM', 'SRR']], left_on='Amp_batch_ID', right_on='Amp_batch_ID')
+
+    # 将结果转换为DataFrame
+    embryo_info_df = embryo_info.reset_index()
+    # print(embryo_info_df)
+
+    # 打开输入BAM文件
+    input_bamfile = pysam.AlignmentFile(f"{SRR_sample}.bam", "rb")
+
+    # 在embryo_info DataFrame中查找与SRR样本相关的行
+    sample_info = embryo_info[embryo_info['SRR'] == SRR_sample]
+
+    # 如果没有找到匹配项，则返回错误消息
+    if sample_info.empty:
+        print(f"No information found for SRR sample {SRR_sample}")
+        return
+
+    sample_info = sample_info.explode('embryo')
+
+    # 获取胚胎信息
+    embryos = sample_info['embryo']
+
+    for i in embryos:
+        cr_tag_values = cr_tag_values[cr_tag_values['embryo'] == i]
+
+        # 获取cell barcode列表
+        cr_tag_values = cr_tag_values['well_barcode']
+
+        # 创建输出BAM文件
+        output_bamfile = pysam.AlignmentFile(f"{output_bam}/{i}.bam", "wb", template=input_bamfile)
+
+        # 遍历BAM文件中的读取记录
+        for read in input_bamfile:
+            # 检查读取的tags属性
+            tags = dict(read.tags)
+
+            # 检查是否包含指定的CR:Z标签
+            if "CR:Z" in tags and tags["CR:Z"] in cr_tag_values:
+                # 将匹配的读取写入输出BAM文件
+                output_bamfile.write(read)
+
+        # 关闭BAM文件
+        input_bamfile.close()
+        output_bamfile.close()
+
+if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s  %(message)s", "%d-%m-%Y %H:%M:%S")
+
+    arg_parser = argparse.ArgumentParser(description="extract reads from different embryos.")
+
+    # embryo extraction
+    arg_parser.add_argument("--input", type=str, help="Input folder with bam", required=True)
+    arg_parser.add_argument("--output", type=str, help="output folder", required=True)
+    arg_parser.add_argument("--version", "-v", action="version", version="embryos 0.1")
+
+    args = arg_parser.parse_args()
+    extract_reads(args.input, args.output)
+
+# Example command
+# extract_reads --input SRR29084300 --output .
