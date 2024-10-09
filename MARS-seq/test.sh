@@ -48,7 +48,7 @@ cd /storage/zhangkaiLab/liaozizhuo5001/data/scrna_TE/convert_10x/extract_embryo
 for file in $(ls ../starsolo/*.bam);do
 	prefix=${file%%.bam}
 	prefix=$(basename $prefix)
-	python test.py --input ../starsolo/${prefix} --output .
+	python extract_embryo.py --input ../starsolo/${prefix} --output .
 	sleep 1
 done
 
